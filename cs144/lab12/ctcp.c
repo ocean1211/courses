@@ -41,9 +41,12 @@ struct ctcp_state {
                                this if this is the case for you */
 
   /* FIXME: Add other needed fields. */
-  uint32_t seqno;
-  uint32_t ackno;
-  int data_len;
+  uint32_t seqno;   // Current sequence number
+  uint32_t ackno;   // Current acknowlegement number
+  ctcp_segment_t *sent_segment;
+  int sent_segment_len;
+  ctcp_segment_t *recv_segment;
+  int recv_segment_len;
 };
 
 /**
@@ -66,14 +69,29 @@ int send_ctcp(ctcp_state_t *state, uint32_t flags, char *data, int len) {
     segment->ackno = htonl(state->ackno);
     segment->len = htons(segment_len);
     segment->flags = htonl(flags);
-    segment->window = MAX_SEG_DATA_SIZE;
+    segment->window = htons(MAX_SEG_DATA_SIZE);
     segment->cksum = 0;
     if (len > 0) {
         memcpy(segment->data, data, len);
     }
     segment->cksum = cksum(segment, segment_len);
-    state->data_len = len;
+
+    // A purge ACK packet
+    if (flags == ACK && len == 0) {
+        return conn_send(state->conn, segment, segment_len);
+    }
+
+    state->sent_segment_len = segment_len;
+    state->sent_segment = segment;
     return conn_send(state->conn, segment, segment_len);
+}
+
+int valid_cksum(ctcp_segment_t *segment, int len) {
+    uint16_t old_cksum = segment->cksum;
+    segment->cksum = 0;
+    uint16_t correct_cksum = cksum(segment, len);
+    segment->cksum = old_cksum;
+    return old_cksum == correct_cksum;
 }
 
 
@@ -95,9 +113,12 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   /* Set fields. */
   state->conn = conn;
   /* FIXME: Do any other initialization here. */
-  state->seqno = 1;
+  state->seqno = 1; // MUST use 1 for CTCP
   state->ackno = 1;
-  state->data_len = 0;
+  state->sent_segment_len = 0;
+  state->sent_segment = NULL;
+  state->recv_segment = NULL;
+  state->recv_segment_len = 0;
   free(cfg);
 
   return state;
@@ -118,7 +139,7 @@ void ctcp_destroy(ctcp_state_t *state) {
 }
 
 void ctcp_read(ctcp_state_t *state) {
-  /* FIXME */
+    /* FIXME */
     char *data = malloc(MAX_SEG_DATA_SIZE);
     if (!data) {
         fprintf(stderr, "Out of memory");
@@ -132,7 +153,6 @@ void ctcp_read(ctcp_state_t *state) {
         return;
     } else if (data_len == -1) {    // Error or EOF
         send_ctcp(state, FIN, NULL, 0);
-        //ctcp_destroy(state);
         free(data);
         return;
     }
@@ -143,42 +163,60 @@ void ctcp_read(ctcp_state_t *state) {
 
 void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     /* FIXME */
-    // Just an ACK packet
+    if (!valid_cksum(segment, len)) {
+        free(segment);
+        return;
+    }
     size_t data_len = len - CTCP_HDR_SIZE;
-    if ((segment->flags & htonl(ACK)) && (data_len == 0)) {
+
+    // Receive a ACK packet
+    if ((segment->flags & TH_ACK) && (data_len == 0)) {
          //&& (state->seqno + state->data_len) == ntohl(segment->ackno)) {
         state->seqno = ntohl(segment->ackno);
+        free(state->sent_segment);
+        state->sent_segment = NULL;
+        state->sent_segment_len = 0;
         free(segment);
         return;
     }
 
-    // Handle duplicated segments
-    /*
-    if ((ntohl(segment->seqno) + data_len) < state->ackno) {
-        free(segment);
-        return;
+    // Receive a data packet
+    if (segment->flags & TH_ACK && state->ackno == ntohl(segment->seqno)) {
+        state->ackno = ntohl(segment->seqno) + data_len;
+        send_ctcp(state, ACK, NULL, 0);
+        state->recv_segment_len = len;
+        state->recv_segment = segment;
+        ctcp_output(state);
     }
-    */
 
-    state->ackno = ntohl(segment->seqno) + data_len;
-    send_ctcp(state, ACK, NULL, 0);
-    ctcp_output(state);
-
-    if (segment->flags & ntohl(FIN)) {
+    // Receive a FIN packet
+    if (segment->flags & TH_FIN) {
+        state->ackno++;
+        send_ctcp(state, ACK, NULL, 0);
         conn_output(state->conn, NULL, 0);
         ctcp_destroy(state);
+        free(segment);
         return;
     }
-
-    conn_output(state->conn, segment->data, data_len);
 
     free(segment);
 }
 
 void ctcp_output(ctcp_state_t *state) {
   /* FIXME */
+    int data_len = state->recv_segment_len - CTCP_HDR_SIZE;
+    if (conn_bufspace(state->conn) >= data_len) {
+        conn_output(state->conn, state->recv_segment->data, data_len);
+    }
 }
 
 void ctcp_timer() {
   /* FIXME */
+    ctcp_state_t *state = state_list;
+    for (; state != NULL; state = state->next) {
+        // TODO: destroy when excess 6 times
+        if (state->sent_segment != NULL) {
+            conn_send(state->conn, state->sent_segment, state->sent_segment_len);
+        }
+    }
 }
